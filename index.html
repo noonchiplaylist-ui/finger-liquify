@@ -70,7 +70,7 @@
   <button id="btnCam">📷 손 추적 시작</button>
   <button id="btnSelect">🎯 오브젝트 선택</button>
   <button id="btnShowMask" style="display:none">👁 영역 표시 중</button>
-  <button id="btnClearMask" style="display:none">전체 모드</button>
+  <button id="btnClearMask" style="display:none">❌ 선택 해제</button>
   <label>Radius <input id="radius" type="range" min="40" max="500" value="140"><span class="val" id="radiusV">140px</span></label>
   <label>Strength <input id="strength" type="range" min="5" max="100" value="35"><span class="val" id="strengthV">35</span></label>
   <label>복원 <input id="relax" type="range" min="0" max="100" value="0"><span class="val" id="relaxV">0</span></label>
@@ -272,6 +272,7 @@ function toggleLock(){
 btnLock.onclick = toggleLock;
 window.addEventListener('keydown', e=>{
   if (e.code === 'Space' && e.target.tagName !== 'INPUT'){ e.preventDefault(); toggleLock(); }
+  if (e.code === 'Escape'){ whiteMask(); clearMaskUI(); }
 });
 
 function step(){
