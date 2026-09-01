@@ -608,6 +608,7 @@ btnCam.onclick = async ()=>{
       runningMode: 'VIDEO',
       numHands: 1
     });
+    btnCam.textContent = '📷 카메라 「허용」을 눌러주세요…';
     const stream = await navigator.mediaDevices.getUserMedia({ video: { width:640, height:480 } });
     video.srcObject = stream;
     await video.play();
@@ -618,7 +619,12 @@ btnCam.onclick = async ()=>{
     trackLoop();
   } catch(err){
     console.error(err);
-    alert('손 추적 시작 실패: ' + err.message + '\n(카메라 권한과 인터넷 연결을 확인해주세요)');
+    const msg = err.name === 'NotAllowedError'
+      ? '카메라 권한이 거부돼 있어요.\n\n주소창 왼쪽 아이콘(🔒 또는 카메라 표시)을 눌러 카메라를 「허용」으로 바꾸고, 새로고침 후 다시 눌러주세요.\n\n맥이라면: 시스템 설정 → 개인정보 보호 및 보안 → 카메라에서 Chrome도 켜져 있어야 해요.'
+      : err.name === 'NotFoundError'
+      ? '카메라를 찾을 수 없어요. 카메라가 연결돼 있는지 확인해주세요.'
+      : '손 추적 시작 실패: ' + err.message + '\n(인터넷 연결을 확인해주세요)';
+    alert(msg);
     btnCam.textContent = '📷 손 추적 시작';
   }
   btnCam.disabled = false;
