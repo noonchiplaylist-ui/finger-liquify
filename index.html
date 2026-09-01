@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Finger Liquify</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; background:#0b0b0e; overflow:hidden;
+    font-family:-apple-system, "Apple SD Gothic Neo", sans-serif; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  #glcanvas { max-width:100%; max-height:100%; touch-action:none; }
+
+  /* 상단 컨트롤 바 */
+  #topbar {
+    position:fixed; top:12px; left:50%; transform:translateX(-50%);
+    display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:center;
+    background:rgba(18,18,22,.82); backdrop-filter:blur(12px);
+    border:1px solid rgba(255,255,255,.08); border-radius:12px;
+    padding:8px 14px; z-index:20; color:#ddd; font-size:12px;
+  }
+  #topbar label { display:flex; align-items:center; gap:6px; white-space:nowrap; }
+  #topbar input[type=range] { width:90px; accent-color:#2ecc71; }
+  #topbar .val { color:#2ecc71; font-variant-numeric:tabular-nums; min-width:34px; }
+  #topbar button {
+    background:rgba(255,255,255,.1); color:#eee; border:1px solid rgba(255,255,255,.15);
+    border-radius:8px; padding:5px 12px; font-size:12px; cursor:pointer;
+  }
+  #topbar button:hover { background:rgba(255,255,255,.2); }
+  #topbar button.on { background:#2ecc71; color:#000; border-color:#2ecc71; }
+
+  /* 웹캠 PIP */
+  #pip {
+    position:fixed; top:64px; right:14px; width:240px; z-index:15;
+    border:1px solid rgba(255,255,255,.2); border-radius:10px; overflow:hidden;
+    background:#000; cursor:grab; user-select:none; display:none;
+  }
+  #pip.show { display:block; }
+  #pip video { width:100%; display:block; transform:scaleX(-1); }
+  #pip .bar {
+    position:absolute; left:0; right:0; padding:3px 8px; font-size:10px; color:#bbb;
+    background:rgba(0,0,0,.55);
+  }
+  #pip .bar.top { top:0; }
+  #pip .bar.bottom { bottom:0; color:#2ecc71; }
+  #fingerdot {
+    position:absolute; width:10px; height:10px; border-radius:50%;
+    background:#2ecc71; box-shadow:0 0 8px #2ecc71; display:none;
+    transform:translate(-50%,-50%); pointer-events:none;
+  }
+
+  #hint {
+    position:fixed; bottom:18px; left:50%; transform:translateX(-50%);
+    color:rgba(255,255,255,.45); font-size:12px; z-index:10; text-align:center;
+  }
+  #drop {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    color:rgba(255,255,255,.5); font-size:15px; z-index:5; pointer-events:none;
+    text-align:center; line-height:1.8;
+  }
+  #drop.hidden { display:none; }
+  input[type=file] { display:none; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="glcanvas"></canvas></div>
+
+<div id="topbar">
+  <button id="btnImg">이미지 열기</button>
+  <button id="btnCam">📷 손 추적 시작</button>
+  <button id="btnSelect">🎯 오브젝트 선택</button>
+  <button id="btnClearMask" style="display:none">전체 모드</button>
+  <label>Radius <input id="radius" type="range" min="40" max="500" value="140"><span class="val" id="radiusV">140px</span></label>
+  <label>Strength <input id="strength" type="range" min="5" max="100" value="35"><span class="val" id="strengthV">35</span></label>
+  <label>복원 <input id="relax" type="range" min="0" max="100" value="0"><span class="val" id="relaxV">0</span></label>
+  <button id="btnLock">🔓 고정</button>
+  <button id="btnReset">리셋</button>
+</div>
+
+<div id="pip">
+  <div class="bar top">Camera Feed · Drag to Move</div>
+  <video id="cam" autoplay playsinline muted></video>
+  <div id="fingerdot"></div>
+  <div class="bar bottom" id="trackStatus">Fingertip · Searching…</div>
+</div>
+
+<div id="drop">이미지를 드래그해서 놓거나<br>「이미지 열기」를 눌러주세요<br><br>마우스 드래그로도 바로 테스트할 수 있어요</div>
+<div id="hint">✊ 주먹에서 검지만 펴면 밀기(초록 점) · 🖐 손을 다 펴면 이동만 (안 밀림)</div>
+<input type="file" id="file" accept="image/*">
+
+<script type="module">
+/* ---------- WebGL 리퀴파이 ---------- */
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl2', { preserveDrawingBuffer:true });
+if (!gl) { alert('WebGL2를 지원하지 않는 브라우저입니다'); throw new Error('no webgl2'); }
+gl.getExtension('EXT_color_buffer_float');
+
+const VS = `#version 300 es
+in vec2 aPos; out vec2 vUv;
+void main(){ vUv = aPos*0.5+0.5; gl_Position = vec4(aPos,0,1); }`;
+
+// 변위 필드 업데이트: 브러시 이동량을 반경 내에 누적
+const FS_UPDATE = `#version 300 es
+precision highp float;
+uniform sampler2D uField, uMask;
+uniform vec2 uRes, uPos, uDelta;
+uniform float uRadius, uStrength, uRelax, uUseMask;
+in vec2 vUv; out vec4 o;
+void main(){
+  vec2 d = texture(uField, vUv).rg;
+  float dist = distance(vUv*uRes, uPos);
+  float f = 1.0 - smoothstep(0.0, uRadius, dist);
+  f *= f;
+  f *= mix(1.0, texture(uMask, vec2(vUv.x, 1.0-vUv.y)).r, uUseMask);
+  d += (uDelta/uRes) * (uStrength*0.02) * f;
+  d *= uRelax;
+  o = vec4(d,0,1);
+}`;
+
+// 이미지를 변위 필드 통과시켜 그리기
+const FS_DRAW = `#version 300 es
+precision highp float;
+uniform sampler2D uField, uImage;
+in vec2 vUv; out vec4 o;
+void main(){
+  vec2 d = texture(uField, vUv).rg;
+  vec2 uv = clamp(vUv - d, 0.0, 1.0);
+  o = texture(uImage, vec2(uv.x, 1.0-uv.y));
+}`;
+
+function makeProg(fsSrc){
+  const c = (t,s)=>{ const sh=gl.createShader(t); gl.shaderSource(sh,s); gl.compileShader(sh);
+    if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    return sh; };
+  const p = gl.createProgram();
+  gl.attachShader(p, c(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, c(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+const progUpdate = makeProg(FS_UPDATE);
+const progDraw = makeProg(FS_DRAW);
+
+const quad = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+function bindQuad(prog){
+  const loc = gl.getAttribLocation(prog, 'aPos');
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+}
+
+let fieldA=null, fieldB=null, fboA=null, fboB=null, imgTex=null;
+let W=0, H=0;
+let maskTex=null, useMask=0, srcCanvas=null;
+
+function whiteMask(){
+  if (!maskTex) maskTex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, maskTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 1, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, new Uint8Array([255]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  useMask = 0;
+}
+
+function makeFieldTex(w,h){
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, w, h, 0, gl.RG, gl.HALF_FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeFbo(tex){
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return f;
+}
+function fitDisplay(){
+  if (!W) return;
+  const stage = document.getElementById('stage');
+  const scale = Math.min(stage.clientWidth/W, stage.clientHeight/H, 1);
+  canvas.style.width = (W*scale)+'px';
+  canvas.style.height = (H*scale)+'px';
+}
+function setupSize(w,h){
+  W=w; H=h;
+  canvas.width=w; canvas.height=h;
+  fitDisplay();
+  fieldA = makeFieldTex(w,h); fieldB = makeFieldTex(w,h);
+  fboA = makeFbo(fieldA); fboB = makeFbo(fieldB);
+  resetField();
+}
+function resetField(){
+  for (const f of [fboA, fboB]){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+}
+
+function loadImage(img){
+  const maxDim = 1600;
+  let w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+  const s = Math.min(1, maxDim/Math.max(w,h));
+  w = Math.round(w*s); h = Math.round(h*s);
+  imgTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, imgTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  srcCanvas = document.createElement('canvas');
+  srcCanvas.width = w; srcCanvas.height = h;
+  srcCanvas.getContext('2d').drawImage(img, 0, 0, w, h);
+  setupSize(w,h);
+  whiteMask();
+  clearMaskUI();
+  document.getElementById('drop').classList.add('hidden');
+}
+
+// 기본 테스트 패턴 (이미지 넣기 전에도 바로 만져볼 수 있게)
+function defaultPattern(){
+  const c = document.createElement('canvas');
+  c.width = 900; c.height = 1200;
+  const x = c.getContext('2d');
+  const g = x.createLinearGradient(0,0,0,c.height);
+  g.addColorStop(0,'#87b7e8'); g.addColorStop(1,'#dfe9f2');
+  x.fillStyle = g; x.fillRect(0,0,c.width,c.height);
+  x.fillStyle = '#6a7480';
+  for (let i=0;i<9;i++){
+    const bw = 60+((i*97)%80), bh = 300+((i*211)%600);
+    x.fillRect(40+i*95, c.height-bh, bw, bh);
+    x.fillStyle = `hsl(${210+i*4} 12% ${38+(i%4)*8}%)`;
+  }
+  loadImage(c);
+  document.getElementById('drop').classList.remove('hidden');
+}
+
+/* ---------- 브러시 상태 ---------- */
+const brush = { x:0, y:0, px:0, py:0, active:false, fresh:true };
+const params = { radius:140, strength:35, relax:0 };
+
+function bindSlider(id, key, fmt){
+  const el = document.getElementById(id), vv = document.getElementById(id+'V');
+  el.addEventListener('input', ()=>{ params[key] = +el.value; vv.textContent = fmt(+el.value); });
+}
+bindSlider('radius','radius', v=>v+'px');
+bindSlider('strength','strength', v=>''+v);
+bindSlider('relax','relax', v=>''+v);
+document.getElementById('btnReset').onclick = resetField;
+
+// 고정(잠금): 켜져 있는 동안엔 무슨 짓을 해도 그림이 안 움직임 (스페이스바로도 토글)
+let locked = false;
+const btnLock = document.getElementById('btnLock');
+function toggleLock(){
+  locked = !locked;
+  brush.active = false;
+  btnLock.textContent = locked ? '🔒 고정됨' : '🔓 고정';
+  btnLock.classList.toggle('on', locked);
+}
+btnLock.onclick = toggleLock;
+window.addEventListener('keydown', e=>{
+  if (e.code === 'Space' && e.target.tagName !== 'INPUT'){ e.preventDefault(); toggleLock(); }
+});
+
+function step(){
+  if (!imgTex) return;
+  gl.viewport(0,0,W,H);
+
+  // 필드 업데이트 (fieldA → fboB)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboB);
+  gl.useProgram(progUpdate);
+  bindQuad(progUpdate);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fieldA);
+  gl.uniform1i(gl.getUniformLocation(progUpdate,'uField'), 0);
+  gl.uniform2f(gl.getUniformLocation(progUpdate,'uRes'), W, H);
+  let dx=0, dy=0, speedScale=1;
+  if (brush.active && !brush.fresh){
+    dx = brush.x - brush.px;
+    dy = brush.y - brush.py;
+    const m = Math.hypot(dx,dy);
+    if (!(m <= 120)) { dx=0; dy=0; }                        // 순간이동·NaN 무시
+    else if (m > 45) speedScale = Math.max(0, 1-(m-45)/60); // 빠른 휘두름은 약하게
+  }
+  if (!Number.isFinite(brush.x + brush.y + dx + dy)){
+    brush.x = brush.px = 0; brush.y = brush.py = 0; dx = 0; dy = 0; brush.active = false;
+  }
+  gl.uniform2f(gl.getUniformLocation(progUpdate,'uPos'), brush.x, H - brush.y);
+  gl.uniform2f(gl.getUniformLocation(progUpdate,'uDelta'), dx, -dy);
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, maskTex);
+  gl.uniform1i(gl.getUniformLocation(progUpdate,'uMask'), 2);
+  gl.uniform1f(gl.getUniformLocation(progUpdate,'uUseMask'), useMask);
+  gl.uniform1f(gl.getUniformLocation(progUpdate,'uRadius'), params.radius);
+  gl.uniform1f(gl.getUniformLocation(progUpdate,'uStrength'), brush.active ? params.strength*speedScale : 0);
+  gl.uniform1f(gl.getUniformLocation(progUpdate,'uRelax'), 1.0 - params.relax*0.0015);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  [fieldA, fieldB] = [fieldB, fieldA];
+  [fboA, fboB] = [fboB, fboA];
+
+  // 화면에 그리기
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.useProgram(progDraw);
+  bindQuad(progDraw);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fieldA);
+  gl.uniform1i(gl.getUniformLocation(progDraw,'uField'), 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, imgTex);
+  gl.uniform1i(gl.getUniformLocation(progDraw,'uImage'), 1);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  brush.px = brush.x; brush.py = brush.y;
+  brush.fresh = false;
+}
+function render(){ step(); requestAnimationFrame(render); }
+
+/* ---------- 마우스/터치 폴백 ---------- */
+function canvasPos(e){
+  const r = canvas.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  return { x:(e.clientX-r.left)/r.width*W, y:(e.clientY-r.top)/r.height*H };
+}
+canvas.addEventListener('pointerdown', e=>{
+  if (selectMode){
+    const p = canvasPos(e);
+    if (p) selectObjectAt(p.x/W, p.y/H);
+    return;
+  }
+  if (locked) return;
+  const p = canvasPos(e);
+  if (!p) return;
+  brush.x=p.x; brush.y=p.y; brush.px=p.x; brush.py=p.y;
+  brush.active=true; brush.fresh=true;
+  try { canvas.setPointerCapture(e.pointerId); } catch(_) {}
+});
+canvas.addEventListener('pointermove', e=>{
+  if (!brush.active || tracking) return;
+  const p = canvasPos(e);
+  if (!p) return;
+  brush.x=p.x; brush.y=p.y;
+});
+canvas.addEventListener('pointerup', ()=>{ if(!tracking) brush.active=false; });
+
+/* ---------- 이미지 로드 ---------- */
+document.getElementById('btnImg').onclick = ()=>document.getElementById('file').click();
+document.getElementById('file').addEventListener('change', e=>{
+  const f = e.target.files[0]; if (f) readImageFile(f);
+});
+function readImageFile(f){
+  const img = new Image();
+  img.onload = ()=>loadImage(img);
+  img.src = URL.createObjectURL(f);
+}
+window.addEventListener('dragover', e=>e.preventDefault());
+window.addEventListener('drop', e=>{
+  e.preventDefault();
+  const f = [...e.dataTransfer.files].find(f=>f.type.startsWith('image/'));
+  if (f) readImageFile(f);
+});
+
+/* ---------- MediaPipe 공용 로더 ---------- */
+let visionLib = null;
+async function getVision(){
+  if (visionLib) return visionLib;
+  const mod = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+  const fileset = await mod.FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  visionLib = { mod, fileset };
+  return visionLib;
+}
+
+/* ---------- 건물 선택 (클릭 → AI 세그멘테이션 → 그 영역만 움직임) ---------- */
+let selectMode = false, segmenter = null;
+const btnSelect = document.getElementById('btnSelect');
+const btnClearMask = document.getElementById('btnClearMask');
+
+btnSelect.onclick = ()=>{
+  selectMode = !selectMode;
+  btnSelect.classList.toggle('on', selectMode);
+  btnSelect.textContent = selectMode ? '👆 움직일 것을 클릭하세요' : '🎯 오브젝트 선택';
+};
+btnClearMask.onclick = ()=>{ whiteMask(); clearMaskUI(); };
+function clearMaskUI(){
+  btnClearMask.style.display = 'none';
+  btnSelect.textContent = '🎯 오브젝트 선택';
+  btnSelect.classList.remove('on');
+  selectMode = false;
+}
+
+async function selectObjectAt(nx, ny){
+  btnSelect.textContent = '분석 중…';
+  try {
+    if (!segmenter){
+      const { mod, fileset } = await getVision();
+      segmenter = await mod.InteractiveSegmenter.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/interactive_segmenter/magic_touch/float32/1/magic_touch.tflite' },
+        outputCategoryMask: true, outputConfidenceMasks: false
+      });
+    }
+    await new Promise((resolve, reject)=>{
+      segmenter.segment(srcCanvas, { keypoint: { x: nx, y: ny } }, res=>{
+        try {
+          const m = res.categoryMask;
+          const mw = m.width, mh = m.height;
+          const arr = m.getAsUint8Array();
+          // 클릭 지점과 같은 카테고리 = 선택한 물체 (카테고리 값 규약과 무관하게 동작)
+          const cx = Math.min(mw-1, Math.floor(nx*mw)), cy = Math.min(mh-1, Math.floor(ny*mh));
+          const objVal = arr[cy*mw + cx];
+          const mc = document.createElement('canvas');
+          mc.width = mw; mc.height = mh;
+          const mctx = mc.getContext('2d');
+          const id = mctx.createImageData(mw, mh);
+          for (let i=0; i<arr.length; i++){
+            const v = arr[i] === objVal ? 255 : 0;
+            id.data[i*4] = v; id.data[i*4+1] = v; id.data[i*4+2] = v; id.data[i*4+3] = 255;
+          }
+          mctx.putImageData(id, 0, 0);
+          // 살짝 블러 = 가장자리 부드럽게 + 여유 마진
+          const soft = document.createElement('canvas');
+          soft.width = mw; soft.height = mh;
+          const sctx = soft.getContext('2d');
+          sctx.filter = 'blur(6px)';
+          sctx.drawImage(mc, 0, 0);
+          sctx.drawImage(mc, 0, 0); // 두 번 그려 중심부 진하게
+          gl.activeTexture(gl.TEXTURE2);
+          gl.bindTexture(gl.TEXTURE_2D, maskTex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, gl.LUMINANCE, gl.UNSIGNED_BYTE, soft);
+          useMask = 1;
+          flashMask(soft);
+          resolve();
+        } catch(e){ reject(e); }
+      });
+    });
+    btnClearMask.style.display = '';
+    btnSelect.textContent = '🎯 다른 오브젝트 선택';
+    btnSelect.classList.remove('on');
+    selectMode = false;
+  } catch(err){
+    console.error(err);
+    alert('오브젝트 인식 실패: ' + err.message + '\n(첫 실행은 인터넷 연결이 필요해요)');
+    clearMaskUI();
+  }
+}
+
+// 선택된 영역을 초록색으로 1초간 보여주기
+function flashMask(maskCanvas){
+  const r = canvas.getBoundingClientRect();
+  const ov = document.createElement('canvas');
+  ov.width = maskCanvas.width; ov.height = maskCanvas.height;
+  const octx = ov.getContext('2d');
+  octx.drawImage(maskCanvas, 0, 0);
+  octx.globalCompositeOperation = 'source-in';
+  octx.fillStyle = 'rgba(46,204,113,0.95)';
+  octx.fillRect(0,0,ov.width,ov.height);
+  ov.style.cssText = `position:fixed;left:${r.left}px;top:${r.top}px;width:${r.width}px;height:${r.height}px;`
+    + 'pointer-events:none;z-index:30;opacity:0.55;transition:opacity 1s ease .6s;';
+  document.body.appendChild(ov);
+  requestAnimationFrame(()=>{ ov.style.opacity = '0'; });
+  setTimeout(()=>ov.remove(), 2000);
+}
+
+/* ---------- MediaPipe 손 추적 ---------- */
+let tracking = false, landmarker = null;
+const video = document.getElementById('cam');
+const dot = document.getElementById('fingerdot');
+const statusEl = document.getElementById('trackStatus');
+const btnCam = document.getElementById('btnCam');
+const smooth = { x:0.5, y:0.5, has:false };
+
+btnCam.onclick = async ()=>{
+  if (tracking) return stopTracking();
+  btnCam.textContent = '모델 로딩…';
+  btnCam.disabled = true;
+  try {
+    const { mod, fileset } = await getVision();
+    landmarker = await mod.HandLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU'
+      },
+      runningMode: 'VIDEO',
+      numHands: 1
+    });
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width:640, height:480 } });
+    video.srcObject = stream;
+    await video.play();
+    tracking = true;
+    document.getElementById('pip').classList.add('show');
+    btnCam.textContent = '추적 중지';
+    btnCam.classList.add('on');
+    trackLoop();
+  } catch(err){
+    console.error(err);
+    alert('손 추적 시작 실패: ' + err.message + '\n(카메라 권한과 인터넷 연결을 확인해주세요)');
+    btnCam.textContent = '📷 손 추적 시작';
+  }
+  btnCam.disabled = false;
+};
+
+function stopTracking(){
+  tracking = false;
+  brush.active = false;
+  smooth.has = false;
+  if (video.srcObject){ video.srcObject.getTracks().forEach(t=>t.stop()); video.srcObject = null; }
+  document.getElementById('pip').classList.remove('show');
+  dot.style.display = 'none';
+  btnCam.textContent = '📷 손 추적 시작';
+  btnCam.classList.remove('on');
+}
+
+function trackLoop(){
+  if (!tracking) return;
+  if (video.readyState >= 2){
+    const res = landmarker.detectForVideo(video, performance.now());
+    if (res.landmarks && res.landmarks.length){
+      const lm = res.landmarks[0];
+      const tip = lm[8];              // 검지 끝
+      // 「검지만 편 포인팅 손모양」일 때만 밀기: 검지는 펴고 중지는 접은 상태
+      const d2 = (a,b)=>Math.hypot(lm[a].x-lm[b].x, lm[a].y-lm[b].y);
+      const indexExt = d2(8,0) > d2(6,0)*1.05;
+      const middleCurl = d2(12,0) < d2(10,0)*1.25;
+      const pointing = !locked && indexExt && middleCurl;
+      const nx = 1 - tip.x;           // 미러
+      const ny = tip.y;
+      if (!smooth.has){ smooth.x = nx; smooth.y = ny; smooth.has = true; }
+      const a = 0.35;                  // 스무딩 (높을수록 즉각적)
+      smooth.x += (nx - smooth.x)*a;
+      smooth.y += (ny - smooth.y)*a;
+      if (pointing){
+        if (!brush.active) brush.fresh = true;
+        brush.active = true;
+        brush.x = smooth.x * W;
+        brush.y = smooth.y * H;
+      } else {
+        brush.active = false;
+      }
+      // PIP 점 표시 (비디오는 CSS 미러라서 좌표도 미러)
+      const pr = video.getBoundingClientRect();
+      const pipEl = document.getElementById('pip');
+      const pp = pipEl.getBoundingClientRect();
+      dot.style.display = 'block';
+      dot.style.background = pointing ? '#2ecc71' : '#999';
+      dot.style.boxShadow = pointing ? '0 0 8px #2ecc71' : 'none';
+      dot.style.left = ((1-tip.x) * pr.width) + 'px';
+      dot.style.top = (pr.top - pp.top + tip.y * pr.height) + 'px';
+      statusEl.textContent = locked ? '🔒 고정됨 · 그림 잠김'
+        : pointing ? 'Fingertip Locked · 밀기 중' : '검지만 펴면 밀기 시작 (손 펴면 이동만)';
+    } else {
+      brush.active = false;
+      smooth.has = false;
+      dot.style.display = 'none';
+      statusEl.textContent = 'Fingertip · Searching…';
+    }
+  }
+  requestAnimationFrame(trackLoop);
+}
+
+/* ---------- PIP 드래그 ---------- */
+const pip = document.getElementById('pip');
+let drag = null;
+pip.addEventListener('pointerdown', e=>{
+  drag = { dx: e.clientX - pip.offsetLeft, dy: e.clientY - pip.offsetTop };
+  pip.setPointerCapture(e.pointerId);
+});
+pip.addEventListener('pointermove', e=>{
+  if (!drag) return;
+  pip.style.left = (e.clientX - drag.dx)+'px';
+  pip.style.top = (e.clientY - drag.dy)+'px';
+  pip.style.right = 'auto';
+});
+pip.addEventListener('pointerup', ()=>drag=null);
+
+window.addEventListener('resize', fitDisplay);
+
+defaultPattern();
+render();
+</script>
+</body>
+</html>
