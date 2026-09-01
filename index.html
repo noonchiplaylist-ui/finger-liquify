@@ -92,9 +92,28 @@
 
 <script type="module">
 /* ---------- WebGL 리퀴파이 ---------- */
+// 화면을 얼리지 않는 알림 배너 (alert 대체)
+function toast(msg){
+  let t = document.getElementById('toast');
+  if (!t){
+    t = document.createElement('div');
+    t.id = 'toast';
+    t.style.cssText = 'position:fixed;top:70px;left:50%;transform:translateX(-50%);'
+      + 'background:rgba(180,50,40,.95);color:#fff;padding:12px 18px;border-radius:10px;'
+      + 'font-size:13px;z-index:50;max-width:82%;white-space:pre-line;line-height:1.55;'
+      + 'box-shadow:0 4px 20px rgba(0,0,0,.4);cursor:pointer;';
+    t.onclick = ()=>{ t.style.display = 'none'; };
+    document.body.appendChild(t);
+  }
+  t.textContent = msg + '\n(누르면 닫힘)';
+  t.style.display = 'block';
+  clearTimeout(t._h);
+  t._h = setTimeout(()=>{ t.style.display = 'none'; }, 12000);
+}
+
 const canvas = document.getElementById('glcanvas');
 const gl = canvas.getContext('webgl2', { preserveDrawingBuffer:true });
-if (!gl) { alert('WebGL2를 지원하지 않는 브라우저입니다'); throw new Error('no webgl2'); }
+if (!gl) { toast('WebGL2를 지원하지 않는 브라우저입니다'); throw new Error('no webgl2'); }
 gl.getExtension('EXT_color_buffer_float');
 
 const VS = `#version 300 es
@@ -500,7 +519,7 @@ async function selectObjectAt(nx, ny){
     btnSelect.textContent = '👆 계속 클릭=추가 · 완료는 여기';
   } catch(err){
     console.error(err);
-    alert('오브젝트 인식 실패: ' + err.message + '\n(첫 실행은 인터넷 연결이 필요해요)');
+    toast('오브젝트 인식 실패: ' + err.message + '\n(첫 실행은 인터넷 연결이 필요해요)');
     clearMaskUI();
   }
   segBusy = false;
@@ -631,7 +650,7 @@ btnCam.onclick = async ()=>{
       : err.name === 'TimeoutError'
       ? '카메라 권한 팝업에 응답이 없었어요.\n\n주소창 왼쪽 아이콘(🔒)을 눌러 카메라를 「허용」으로 바꾸고 새로고침 후 다시 시도해주세요.'
       : '손 추적 시작 실패: ' + err.message + '\n(인터넷 연결을 확인해주세요)';
-    alert(msg);
+    toast(msg);
     btnCam.textContent = '📷 손 추적 시작';
   }
   camStarting = false;
