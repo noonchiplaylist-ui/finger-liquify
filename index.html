@@ -69,6 +69,7 @@
   <button id="btnImg">이미지 열기</button>
   <button id="btnCam">📷 손 추적 시작</button>
   <button id="btnSelect">🎯 오브젝트 선택</button>
+  <button id="btnPaint">🖌 직접 칠하기</button>
   <button id="btnShowMask" style="display:none">👁 영역 표시 중</button>
   <button id="btnClearMask" style="display:none">❌ 선택 해제</button>
   <label>Radius <input id="radius" type="range" min="40" max="500" value="140"><span class="val" id="radiusV">140px</span></label>
@@ -86,7 +87,7 @@
 </div>
 
 <div id="drop">이미지를 드래그해서 놓거나<br>「이미지 열기」를 눌러주세요<br><br>마우스 드래그로도 바로 테스트할 수 있어요</div>
-<div id="hint">✊ 주먹에서 검지만 펴면 밀기(초록 점) · 🖐 손을 다 펴면 이동만 (안 밀림)</div>
+<div id="hint">✊ 검지만 펴면 밀기 · 🖐 손 펴면 이동만<br>🖌 칠하기: 드래그=추가 · ⌥(Alt)드래그=지우기 · 브러시 크기=Radius</div>
 <input type="file" id="file" accept="image/*">
 
 <script type="module">
@@ -277,6 +278,11 @@ window.addEventListener('keydown', e=>{
 
 function step(){
   if (!imgTex) return;
+  if (paintDirty && paintCanvas){
+    uploadMaskFromAlpha(paintCanvas);
+    showMaskOverlay(paintCanvas);
+    paintDirty = false;
+  }
   gl.viewport(0,0,W,H);
 
   // 필드 업데이트 (fieldA → fboB)
@@ -335,6 +341,14 @@ function canvasPos(e){
   return { x:(e.clientX-r.left)/r.width*W, y:(e.clientY-r.top)/r.height*H };
 }
 canvas.addEventListener('pointerdown', e=>{
+  if (paintMode){
+    const p = canvasPos(e);
+    if (!p) return;
+    painting = true;
+    paintAt(p.x, p.y, e.altKey || (e.buttons & 2));
+    try { canvas.setPointerCapture(e.pointerId); } catch(_) {}
+    return;
+  }
   if (selectMode){
     const p = canvasPos(e);
     if (p) selectObjectAt(p.x/W, p.y/H);
@@ -348,12 +362,17 @@ canvas.addEventListener('pointerdown', e=>{
   try { canvas.setPointerCapture(e.pointerId); } catch(_) {}
 });
 canvas.addEventListener('pointermove', e=>{
+  if (painting){
+    const p = canvasPos(e);
+    if (p) paintAt(p.x, p.y, e.altKey || (e.buttons & 2));
+    return;
+  }
   if (!brush.active || tracking) return;
   const p = canvasPos(e);
   if (!p) return;
   brush.x=p.x; brush.y=p.y;
 });
-canvas.addEventListener('pointerup', ()=>{ if(!tracking) brush.active=false; });
+canvas.addEventListener('pointerup', ()=>{ painting=false; if(!tracking) brush.active=false; });
 
 /* ---------- 이미지 로드 ---------- */
 document.getElementById('btnImg').onclick = ()=>document.getElementById('file').click();
@@ -383,15 +402,29 @@ async function getVision(){
   return visionLib;
 }
 
-/* ---------- 건물 선택 (클릭 → AI 세그멘테이션 → 그 영역만 움직임) ---------- */
-let selectMode = false, segmenter = null;
+/* ---------- 오브젝트 선택 (클릭 → AI 세그멘테이션 → 그 영역만 움직임) ---------- */
+let selectMode = false, segmenter = null, segBusy = false, maskAlphaCanvas = null;
 const btnSelect = document.getElementById('btnSelect');
 const btnClearMask = document.getElementById('btnClearMask');
 
+// 알파 채널이 마스크인 캔버스를 GL 마스크 텍스처로 업로드 (알파를 직접 휘도로)
+function uploadMaskFromAlpha(c){
+  const w = c.width, h = c.height;
+  const d = c.getContext('2d').getImageData(0, 0, w, h).data;
+  const lum = new Uint8Array(w*h);
+  for (let i=0; i<w*h; i++) lum[i] = d[i*4+3];
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, maskTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, w, h, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, lum);
+  useMask = 1;
+}
+
 btnSelect.onclick = ()=>{
   selectMode = !selectMode;
+  if (selectMode && paintMode) exitPaintMode();
   btnSelect.classList.toggle('on', selectMode);
-  btnSelect.textContent = selectMode ? '👆 움직일 것을 클릭하세요' : '🎯 오브젝트 선택';
+  btnSelect.textContent = selectMode ? '👆 클릭해서 선택 (여러 번=추가)' : '🎯 오브젝트 선택';
 };
 btnClearMask.onclick = ()=>{ whiteMask(); clearMaskUI(); };
 function clearMaskUI(){
@@ -399,11 +432,16 @@ function clearMaskUI(){
   btnSelect.textContent = '🎯 오브젝트 선택';
   btnSelect.classList.remove('on');
   selectMode = false;
+  maskAlphaCanvas = null;
+  if (paintMode) exitPaintMode();
+  painting = false;
   if (maskOverlayEl) maskOverlayEl.style.display = 'none';
   btnShowMask.style.display = 'none';
 }
 
 async function selectObjectAt(nx, ny){
+  if (segBusy) return;
+  segBusy = true;
   btnSelect.textContent = '분석 중…';
   try {
     if (!segmenter){
@@ -439,11 +477,7 @@ async function selectObjectAt(nx, ny){
           sctx.filter = 'blur(6px)';
           sctx.drawImage(mc, 0, 0);
           sctx.drawImage(mc, 0, 0); // 두 번 그려 중심부 진하게
-          gl.activeTexture(gl.TEXTURE2);
-          gl.bindTexture(gl.TEXTURE_2D, maskTex);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, gl.LUMINANCE, gl.UNSIGNED_BYTE, soft);
-          useMask = 1;
-          // 표시용 알파 마스크 (마스크 밝기 → 투명도)
+          // 알파 마스크로 변환 (마스크 밝기 → 투명도)
           const am = document.createElement('canvas');
           am.width = mw; am.height = mh;
           const actx = am.getContext('2d');
@@ -454,20 +488,22 @@ async function selectObjectAt(nx, ny){
             aid.data[i] = 255; aid.data[i+1] = 255; aid.data[i+2] = 255;
           }
           actx.putImageData(aid, 0, 0);
+          if (maskAlphaCanvas) actx.drawImage(maskAlphaCanvas, 0, 0, mw, mh); // 기존 선택에 추가
+          maskAlphaCanvas = am;
+          uploadMaskFromAlpha(am);
           showMaskOverlay(am);
           resolve();
         } catch(e){ reject(e); }
       });
     });
     btnClearMask.style.display = '';
-    btnSelect.textContent = '🎯 다른 오브젝트 선택';
-    btnSelect.classList.remove('on');
-    selectMode = false;
+    btnSelect.textContent = '👆 계속 클릭=추가 · 완료는 여기';
   } catch(err){
     console.error(err);
     alert('오브젝트 인식 실패: ' + err.message + '\n(첫 실행은 인터넷 연결이 필요해요)');
     clearMaskUI();
   }
+  segBusy = false;
 }
 
 // 선택된 영역을 초록색으로 계속 표시 (녹화 전엔 버튼으로 끔)
@@ -505,6 +541,50 @@ btnShowMask.onclick = ()=>{
   btnShowMask.classList.toggle('on', !showing);
   btnShowMask.textContent = showing ? '👁 영역 표시' : '👁 영역 표시 중';
 };
+
+/* ---------- 직접 칠하기 (AI 대신 마우스로 마스크 그리기) ---------- */
+let paintMode = false, painting = false, paintDirty = false, paintCanvas = null;
+const btnPaint = document.getElementById('btnPaint');
+
+function exitPaintMode(){
+  paintMode = false; painting = false;
+  btnPaint.classList.remove('on');
+  btnPaint.textContent = '🖌 직접 칠하기';
+}
+btnPaint.onclick = ()=>{
+  if (paintMode) return exitPaintMode();
+  paintMode = true;
+  if (selectMode){
+    selectMode = false;
+    btnSelect.classList.remove('on');
+    btnSelect.textContent = '🎯 오브젝트 선택';
+  }
+  btnPaint.classList.add('on');
+  btnPaint.textContent = '🖌 칠하는 중 · 완료는 여기';
+  if (!paintCanvas || paintCanvas.width !== W || paintCanvas.height !== H){
+    paintCanvas = document.createElement('canvas');
+    paintCanvas.width = W; paintCanvas.height = H;
+  }
+  const x = paintCanvas.getContext('2d');
+  x.clearRect(0, 0, W, H);
+  if (maskAlphaCanvas) x.drawImage(maskAlphaCanvas, 0, 0, W, H); // 기존 선택에서 시작
+  maskAlphaCanvas = paintCanvas;
+  paintDirty = true;
+  btnClearMask.style.display = '';
+};
+function paintAt(px, py, erase){
+  const x = paintCanvas.getContext('2d');
+  const rad = Math.max(12, params.radius * 0.5);
+  const g = x.createRadialGradient(px, py, rad*0.45, px, py, rad);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  x.globalCompositeOperation = erase ? 'destination-out' : 'source-over';
+  x.fillStyle = g;
+  x.beginPath(); x.arc(px, py, rad, 0, 7); x.fill();
+  x.globalCompositeOperation = 'source-over';
+  paintDirty = true;
+}
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
 
 /* ---------- MediaPipe 손 추적 ---------- */
 let tracking = false, landmarker = null;
