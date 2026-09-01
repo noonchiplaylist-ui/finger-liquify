@@ -69,6 +69,7 @@
   <button id="btnImg">이미지 열기</button>
   <button id="btnCam">📷 손 추적 시작</button>
   <button id="btnSelect">🎯 오브젝트 선택</button>
+  <button id="btnShowMask" style="display:none">👁 영역 표시 중</button>
   <button id="btnClearMask" style="display:none">전체 모드</button>
   <label>Radius <input id="radius" type="range" min="40" max="500" value="140"><span class="val" id="radiusV">140px</span></label>
   <label>Strength <input id="strength" type="range" min="5" max="100" value="35"><span class="val" id="strengthV">35</span></label>
@@ -190,6 +191,7 @@ function fitDisplay(){
   const scale = Math.min(stage.clientWidth/W, stage.clientHeight/H, 1);
   canvas.style.width = (W*scale)+'px';
   canvas.style.height = (H*scale)+'px';
+  positionMaskOverlay();
 }
 function setupSize(w,h){
   W=w; H=h;
@@ -396,6 +398,8 @@ function clearMaskUI(){
   btnSelect.textContent = '🎯 오브젝트 선택';
   btnSelect.classList.remove('on');
   selectMode = false;
+  if (maskOverlayEl) maskOverlayEl.style.display = 'none';
+  btnShowMask.style.display = 'none';
 }
 
 async function selectObjectAt(nx, ny){
@@ -438,7 +442,18 @@ async function selectObjectAt(nx, ny){
           gl.bindTexture(gl.TEXTURE_2D, maskTex);
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, gl.LUMINANCE, gl.UNSIGNED_BYTE, soft);
           useMask = 1;
-          flashMask(soft);
+          // 표시용 알파 마스크 (마스크 밝기 → 투명도)
+          const am = document.createElement('canvas');
+          am.width = mw; am.height = mh;
+          const actx = am.getContext('2d');
+          actx.drawImage(soft, 0, 0);
+          const aid = actx.getImageData(0, 0, mw, mh);
+          for (let i=0; i<aid.data.length; i+=4){
+            aid.data[i+3] = aid.data[i];
+            aid.data[i] = 255; aid.data[i+1] = 255; aid.data[i+2] = 255;
+          }
+          actx.putImageData(aid, 0, 0);
+          showMaskOverlay(am);
           resolve();
         } catch(e){ reject(e); }
       });
@@ -454,22 +469,41 @@ async function selectObjectAt(nx, ny){
   }
 }
 
-// 선택된 영역을 초록색으로 1초간 보여주기
-function flashMask(maskCanvas){
+// 선택된 영역을 초록색으로 계속 표시 (녹화 전엔 버튼으로 끔)
+let maskOverlayEl = null;
+const btnShowMask = document.getElementById('btnShowMask');
+function positionMaskOverlay(){
+  if (!maskOverlayEl) return;
   const r = canvas.getBoundingClientRect();
-  const ov = document.createElement('canvas');
-  ov.width = maskCanvas.width; ov.height = maskCanvas.height;
-  const octx = ov.getContext('2d');
-  octx.drawImage(maskCanvas, 0, 0);
-  octx.globalCompositeOperation = 'source-in';
-  octx.fillStyle = 'rgba(46,204,113,0.95)';
-  octx.fillRect(0,0,ov.width,ov.height);
-  ov.style.cssText = `position:fixed;left:${r.left}px;top:${r.top}px;width:${r.width}px;height:${r.height}px;`
-    + 'pointer-events:none;z-index:30;opacity:0.55;transition:opacity 1s ease .6s;';
-  document.body.appendChild(ov);
-  requestAnimationFrame(()=>{ ov.style.opacity = '0'; });
-  setTimeout(()=>ov.remove(), 2000);
+  maskOverlayEl.style.left = r.left+'px';
+  maskOverlayEl.style.top = r.top+'px';
+  maskOverlayEl.style.width = r.width+'px';
+  maskOverlayEl.style.height = r.height+'px';
 }
+function showMaskOverlay(alphaCanvas){
+  if (!maskOverlayEl){
+    maskOverlayEl = document.createElement('canvas');
+    maskOverlayEl.style.cssText = 'position:fixed;pointer-events:none;z-index:8;opacity:0.4;';
+    document.body.appendChild(maskOverlayEl);
+  }
+  maskOverlayEl.width = alphaCanvas.width; maskOverlayEl.height = alphaCanvas.height;
+  const x = maskOverlayEl.getContext('2d');
+  x.drawImage(alphaCanvas, 0, 0);
+  x.globalCompositeOperation = 'source-in';
+  x.fillStyle = '#2ecc71';
+  x.fillRect(0, 0, maskOverlayEl.width, maskOverlayEl.height);
+  maskOverlayEl.style.display = '';
+  positionMaskOverlay();
+  btnShowMask.style.display = '';
+  btnShowMask.classList.add('on');
+  btnShowMask.textContent = '👁 영역 표시 중';
+}
+btnShowMask.onclick = ()=>{
+  const showing = maskOverlayEl && maskOverlayEl.style.display !== 'none';
+  if (maskOverlayEl) maskOverlayEl.style.display = showing ? 'none' : '';
+  btnShowMask.classList.toggle('on', !showing);
+  btnShowMask.textContent = showing ? '👁 영역 표시' : '👁 영역 표시 중';
+};
 
 /* ---------- MediaPipe 손 추적 ---------- */
 let tracking = false, landmarker = null;
